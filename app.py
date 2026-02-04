@@ -21,6 +21,8 @@ from copy import copy
 import json
 import glob
 from copy import copy
+from PIL import ImageEnhance, ImageFilter
+
 # ==========================================================
 # 1) CẤU HÌNH APP & SESSION STATE
 # ==========================================================
@@ -319,55 +321,86 @@ def _cell_to_text(v):
 # 5) ROSTER (DANH SÁCH SV TỪ EXCEL) + SYNC FOLDER
 # ==========================================================
 def find_excel_header_in_sheet(sheet):
-    """
-    Tìm dòng header và mapping cột theo template IUH.
-    Trả về: (header_row, cols)
-    cols có thể gồm: stt, mssv, ho, ten, gioitinh, ngaysinh, lophoc
-    """
-    header_row = None
-    cols = {
-        "stt": None,
-        "mssv": None,
-        "ho": None,
-        "ten": None,
-        "gioitinh": None,
-        "ngaysinh": None,
-        "lophoc": None,
-    }
+    cols = {"stt": None, "mssv": None, "ho": None, "ten": None,
+            "gioitinh": None, "ngaysinh": None, "lophoc": None}
 
-    for r in range(1, 26):
+    def norm(v):
+        return str(v).strip().lower().replace("\n", " ")
+
+    def cell_text(r, c):
+        real = get_real_cell(sheet, r, c)  # ✅ master cell nếu merge
+        if not real or real.value is None:
+            return ""
+        return norm(real.value)
+
+    best_row = None
+    best_score = -1
+
+    # quét 1..40 cho chắc
+    for r in range(1, 41):
+        hit = {}
         for c in range(1, sheet.max_column + 1):
-            cell = sheet.cell(row=r, column=c)
-            if isinstance(cell, MergedCell):
+            t = cell_text(r, c)
+            if not t:
                 continue
-            val = str(cell.value).strip().lower() if cell.value else ""
+            hit[t] = c
 
-            if val == "stt" or "số thứ tự" in val:
-                cols["stt"] = c
-            elif ("mã sinh viên" in val) or (val == "mssv") or ("mssv" in val):
-                header_row = r
-                cols["mssv"] = c
-            elif val in ["họ đệm", "họ", "họ và tên", "họ tên"]:
-                cols["ho"] = c
-            elif val == "tên":
-                cols["ten"] = c
-            elif "giới tính" in val:
-                cols["gioitinh"] = c
-            elif "ngày sinh" in val:
-                cols["ngaysinh"] = c
-            elif val == "lớp học" or val == "lớp":
-                cols["lophoc"] = c
+        # tìm theo contains (vì có thể có khoảng trắng, xuống dòng)
+        stt_col = None
+        mssv_col = None
 
-        if header_row and cols["mssv"]:
-            break
+        for t, c in hit.items():
+            if t == "stt" or "số thứ tự" in t:
+                stt_col = c
+            if "mã sinh viên" in t or t == "mssv" or "ma sinh vien" in t:
+                mssv_col = c
+
+        # score: càng đủ trường càng tốt
+        score = 0
+        if stt_col: score += 2
+        if mssv_col: score += 3
+        if any("họ đệm" in t or t == "họ" for t in hit): score += 1
+        if any(t == "tên" for t in hit): score += 1
+        if any("giới tính" in t for t in hit): score += 1
+        if any("ngày sinh" in t for t in hit): score += 1
+        if any("lớp học" in t or t == "lớp" for t in hit): score += 1
+
+        # ✅ CHỈ nhận header nếu có cả STT và Mã sinh viên
+        if stt_col and mssv_col and score > best_score:
+            best_score = score
+            best_row = r
+
+    if not best_row:
+        return None, cols
+
+    header_row = best_row
+
+    # fill cols theo header_row đã chốt
+    for c in range(1, sheet.max_column + 1):
+        t = cell_text(header_row, c)
+        if not t:
+            continue
+        if t == "stt" or "số thứ tự" in t:
+            cols["stt"] = c
+        elif "mã sinh viên" in t or t == "mssv" or "ma sinh vien" in t:
+            cols["mssv"] = c
+        elif t in ["họ đệm", "họ"] or "họ đệm" in t:
+            cols["ho"] = c
+        elif t == "tên":
+            cols["ten"] = c
+        elif "giới tính" in t:
+            cols["gioitinh"] = c
+        elif "ngày sinh" in t:
+            cols["ngaysinh"] = c
+        elif "lớp học" in t or t == "lớp":
+            cols["lophoc"] = c
 
     return header_row, cols
 
+
+
+
 def load_roster_from_excel_path(excel_path: str) -> pd.DataFrame:
-    """
-    ✅ Nâng cấp: đọc đầy đủ các cột cần cho SV mới:
-    - Mã sinh viên, Họ đệm, Tên, Giới tính, Ngày sinh, Lớp học
-    """
     if not os.path.exists(excel_path):
         return pd.DataFrame()
 
@@ -378,17 +411,37 @@ def load_roster_from_excel_path(excel_path: str) -> pd.DataFrame:
         if not header_row or not cols.get("mssv"):
             return pd.DataFrame()
 
+        def _row_has_total(r: int) -> bool:
+    # ✅ dò cả dòng, nhưng lấy ô MASTER nếu merge (không skip MergedCell)
+            for c in range(1, sheet.max_column + 1):
+                real = get_real_cell(sheet, r, c)
+                if not real:
+                    continue
+                v = str(real.value).strip().lower() if real.value is not None else ""
+                if "tổng" in v:
+                    return True
+            return False
         rows = []
+        started = False
+
         for r in range(header_row + 1, sheet.max_row + 1):
+            if _row_has_total(r):
+                break
+
             m_cell = sheet.cell(row=r, column=cols["mssv"])
             if isinstance(m_cell, MergedCell):
                 continue
+
             mssv = str(m_cell.value).strip() if m_cell.value else ""
+
+            # ✅ nếu đã bắt đầu đọc data rồi mà gặp trống -> coi như hết bảng (dừng để tránh footer)
             if not mssv:
-                # nếu gặp dòng trống -> coi như kết thúc
-                continue
-            if "tổng" in mssv.lower():
-                break
+                if started:
+                    break
+                else:
+                    continue
+
+            started = True
 
             ho = _cell_to_text(sheet.cell(row=r, column=cols["ho"]).value) if cols.get("ho") else ""
             ten = _cell_to_text(sheet.cell(row=r, column=cols["ten"]).value) if cols.get("ten") else ""
@@ -402,7 +455,7 @@ def load_roster_from_excel_path(excel_path: str) -> pd.DataFrame:
             rows.append({
                 "MSSV": mssv.strip(),
                 "Họ đệm": ho,
-                "Họ": ho,  # alias để không gãy code cũ
+                "Họ": ho,  # alias
                 "Tên": ten,
                 "Họ tên": full_name,
                 "Giới tính": gt,
@@ -415,8 +468,10 @@ def load_roster_from_excel_path(excel_path: str) -> pd.DataFrame:
             df["MSSV"] = df["MSSV"].astype(str).str.strip()
             df = df.drop_duplicates(subset=["MSSV"]).reset_index(drop=True)
         return df
+
     except:
         return pd.DataFrame()
+
 
 def save_roster_json(class_name: str, df_roster: pd.DataFrame):
     class_path = os.path.join(ROOT_FOLDER, class_name)
@@ -433,20 +488,33 @@ def load_roster(class_name: str, autosync_folders: bool = True) -> pd.DataFrame:
     roster_path = os.path.join(class_path, ROSTER_JSON)
 
     df = pd.DataFrame()
+
     try:
         excel_mtime = os.path.getmtime(excel_path) if os.path.exists(excel_path) else 0
         roster_mtime = os.path.getmtime(roster_path) if os.path.exists(roster_path) else 0
+
+        # ✅ Nếu roster.json mới hơn hoặc bằng excel -> dùng roster.json
         if os.path.exists(roster_path) and roster_mtime >= excel_mtime:
-            df = pd.read_json(roster_path)
-        else:
+            try:
+                df = pd.read_json(roster_path)
+            except:
+                df = pd.DataFrame()
+
+        # ✅ Ngược lại: Excel mới hơn -> đọc lại từ Excel rồi ghi đè roster.json
+        if df is None or df.empty:
             df = load_roster_from_excel_path(excel_path)
-            if not df.empty:
+            if df is not None and not df.empty:
                 save_roster_json(class_name, df)
+
     except:
+        # fallback: cố đọc excel
         df = load_roster_from_excel_path(excel_path)
 
-    # đảm bảo có đủ các cột (nếu roster.json cũ)
-    if not df.empty:
+    # normalize cột
+    if df is not None and not df.empty:
+        if "MSSV" in df.columns:
+            df["MSSV"] = df["MSSV"].astype(str).str.strip()
+
         if "Họ tên" not in df.columns:
             ho = df["Họ"].astype(str) if "Họ" in df.columns else ""
             ten = df["Tên"].astype(str) if "Tên" in df.columns else ""
@@ -459,12 +527,17 @@ def load_roster(class_name: str, autosync_folders: bool = True) -> pd.DataFrame:
         if "Họ" not in df.columns and "Họ đệm" in df.columns:
             df["Họ"] = df["Họ đệm"]
 
-    if autosync_folders and not df.empty:
+    # autosync folders
+    if autosync_folders and df is not None and not df.empty and "MSSV" in df.columns:
         for mssv in df["MSSV"].astype(str).tolist():
-            os.makedirs(os.path.join(img_base, str(mssv).strip()), exist_ok=True)
-            os.makedirs(os.path.join(class_path, BAD_IMG_DIR, str(mssv).strip()), exist_ok=True)
+            ms = str(mssv).strip()
+            if not ms:
+                continue
+            os.makedirs(os.path.join(img_base, ms), exist_ok=True)
+            os.makedirs(os.path.join(class_path, BAD_IMG_DIR, ms), exist_ok=True)
 
     return df
+
 
 def sync_roster_folders(class_name: str):
     df = load_roster(class_name, autosync_folders=True)
@@ -522,16 +595,34 @@ def _safe_save_wb(wb, file_path: str, class_path: str, prefix: str):
 def _renumber_stt(sheet, header_row: int, cols: dict):
     if not cols.get("stt") or not cols.get("mssv"):
         return
+
+    def _row_has_total(r: int) -> bool:
+        for c in range(1, sheet.max_column + 1):
+            cell = sheet.cell(row=r, column=c)
+            if isinstance(cell, MergedCell):
+                continue
+            v = str(cell.value).strip().lower() if cell.value is not None else ""
+            if "tổng" in v:
+                return True
+        return False
+
     idx = 1
     for r in range(header_row + 1, sheet.max_row + 1):
-        m = sheet.cell(row=r, column=cols["mssv"]).value
-        mssv = str(m).strip() if m else ""
+        if _row_has_total(r):
+            break
+
+        mcell = sheet.cell(row=r, column=cols["mssv"])
+        if isinstance(mcell, MergedCell):
+            continue
+
+        mv = mcell.value
+        mssv = str(mv).strip() if mv else ""
         if not mssv:
             continue
-        if "tổng" in mssv.lower():
-            break
+
         sheet.cell(row=r, column=cols["stt"]).value = idx
         idx += 1
+
 
 def add_student_to_excel(class_name: str, student: dict):
     """
@@ -541,11 +632,9 @@ def add_student_to_excel(class_name: str, student: dict):
     class_path = os.path.join(ROOT_FOLDER, class_name)
     file_path = os.path.join(class_path, EXCEL_NAME)
 
-    # check excel exists
     if not os.path.exists(file_path):
         return False, "⚠️ Lớp chưa có file Excel. Excel chưa được cập nhật.", None
 
-    # check lock file (~$DanhSachLop.xlsx)
     lock_path = os.path.join(class_path, "~$" + EXCEL_NAME)
     if os.path.exists(lock_path):
         return False, f"❌ Excel đang mở/LOCK: {lock_path}. Hãy đóng Excel rồi thử lại.", None
@@ -554,37 +643,26 @@ def add_student_to_excel(class_name: str, student: dict):
         wb = openpyxl.load_workbook(file_path)
         sheet = wb.active
 
+        # =========================
+        # 0) HEADER MAP (FIX CHẶT)
+        # =========================
         header_row, cols = find_excel_header_in_sheet(sheet)
-        if not header_row or not cols.get("mssv"):
-            return False, "❌ Không tìm thấy header/cột MSSV trong Excel.", None
+
+        # ✅ CHẶN: phải có cả STT và MSSV, và KHÔNG được trùng cột
+        if (not header_row) or (not cols.get("mssv")) or (not cols.get("stt")):
+            return False, f"❌ Không tìm thấy header chuẩn (thiếu STT/MSSV). header_row={header_row}, cols={cols}", None
+
+        if cols["mssv"] == cols["stt"]:
+            return False, f"❌ Map sai cột: MSSV đang trùng cột STT (c={cols['mssv']}). Hãy sửa find_excel_header_in_sheet.", None
 
         target_mssv = str(student.get("MSSV", "")).strip()
         if not target_mssv:
             return False, "❌ MSSV rỗng.", None
 
-        # ---------- helpers ----------
-        def _merged_master_cell(row: int, col: int):
-            """
-            Nếu (row,col) nằm trong merge và là MergedCell -> trả về ô master (góc trái-trên).
-            Nếu không -> trả về chính nó.
-            """
-            cell = sheet.cell(row=row, column=col)
-            if not isinstance(cell, MergedCell):
-                return cell
-
-            for rng in sheet.merged_cells.ranges:
-                if rng.min_row <= row <= rng.max_row and rng.min_col <= col <= rng.max_col:
-                    return sheet.cell(row=rng.min_row, column=rng.min_col)
-
-            # fallback (hiếm)
-            return sheet.cell(row=row, column=col)
-
-        def _safe_set(row: int, col: int, value):
-            c = _merged_master_cell(row, col)
-            c.value = value
-
+        # =========================
+        # helpers
+        # =========================
         def _row_has_total(r: int) -> bool:
-            # kiểm tra text "tổng" trên toàn dòng, nhưng chỉ đọc ô master để tránh MergedCell
             for c in range(1, sheet.max_column + 1):
                 cell = sheet.cell(row=r, column=c)
                 if isinstance(cell, MergedCell):
@@ -594,25 +672,49 @@ def add_student_to_excel(class_name: str, student: dict):
                     return True
             return False
 
-        def _is_row_safe_for_insert(r: int) -> bool:
-            # tránh dòng merge kiểu "Tổng cộng" hoặc dòng tiêu đề phụ
+        def _cell_is_merged(r: int, c: int) -> bool:
+            return isinstance(sheet.cell(row=r, column=c), MergedCell)
+
+        def _row_has_any_merge(r: int) -> bool:
+            for key in ["stt", "mssv", "ho", "ten", "gioitinh", "ngaysinh", "lophoc"]:
+                cc = cols.get(key)
+                if cc and _cell_is_merged(r, cc):
+                    return True
+            return False
+
+        def _row_is_blank_data(r: int) -> bool:
+            # dòng trống thật: MSSV trống + không dính merge + không phải total
             if _row_has_total(r):
                 return False
-            # nếu cell MSSV là merged -> cũng tránh
-            mcell = sheet.cell(row=r, column=cols["mssv"])
-            if isinstance(mcell, MergedCell):
+            if _row_has_any_merge(r):
                 return False
-            return True
+            real = get_real_cell(sheet, r, cols["mssv"])
+            v = real.value if real else None
+            return (v is None) or (str(v).strip() == "")
 
-        # ---------- 1) check duplicate ----------
+        def _safe_set(row: int, col: int, value):
+            # ✅ LUÔN ghi vào master cell (nếu merge) để tránh ghi lạc
+            real = get_real_cell(sheet, row, col)
+            if real is None:
+                raise ValueError(f"❌ Không lấy được ô thật ({row},{col}).")
+            if isinstance(real, MergedCell):
+                raise ValueError(f"❌ Ô ({row},{col}) đang MERGE nên không thể ghi.")
+            real.value = value
+
+        def _set(col_key, value):
+            if cols.get(col_key):
+                _safe_set(insert_row, cols[col_key], value)
+
+        # =========================
+        # 1) check duplicate
+        # =========================
         for r in range(header_row + 1, sheet.max_row + 1):
             if _row_has_total(r):
                 break
 
-            mcell = sheet.cell(row=r, column=cols["mssv"])
-            if isinstance(mcell, MergedCell):
+            mcell = get_real_cell(sheet, r, cols["mssv"])
+            if not mcell:
                 continue
-
             mv = mcell.value
             mssv = str(mv).strip() if mv else ""
             if not mssv:
@@ -621,40 +723,45 @@ def add_student_to_excel(class_name: str, student: dict):
             if mssv.upper() == target_mssv.upper():
                 return False, f"⚠️ MSSV {target_mssv} đã tồn tại trong Excel.", None
 
-        # ---------- 2) find insert_row ----------
-        insert_row = None
+        # =========================
+        # 2) find total_row
+        # =========================
         total_row = None
-
-        # tìm total_row trước
         for r in range(header_row + 1, sheet.max_row + 1):
             if _row_has_total(r):
                 total_row = r
                 break
 
-        # ưu tiên: nếu có dòng trống trước total_row và “an toàn” -> chèn vào đó
-        scan_end = total_row if total_row else (sheet.max_row + 1)
-        for r in range(header_row + 1, scan_end):
-            if not _is_row_safe_for_insert(r):
-                continue
+        if not total_row:
+            return False, "❌ Không tìm thấy dòng 'Tổng cộng' trong Excel.", None
 
-            mv = sheet.cell(row=r, column=cols["mssv"]).value
-            mssv = str(mv).strip() if mv else ""
-            if not mssv:
+        # =========================
+        # 3) chọn insert_row an toàn
+        # =========================
+        insert_row = None
+
+        # ưu tiên dòng trống thật trước total_row
+        for r in range(header_row + 1, total_row):
+            if _row_is_blank_data(r):
                 insert_row = r
                 break
 
-        # nếu không có dòng trống hợp lệ:
+        # nếu không có dòng trống thật -> insert ngay trước total_row
         if insert_row is None:
-            if total_row:
-                insert_row = total_row
-                sheet.insert_rows(insert_row, 1)  # chèn ngay trước tổng
-                # total_row bị đẩy xuống 1 dòng
-                total_row = total_row + 1
-            else:
-                insert_row = sheet.max_row + 1
+            insert_row = total_row
+            sheet.insert_rows(insert_row, 1)
+            total_row += 1
 
-        # ---------- 3) copy style từ template row ----------
-        template_row = max(header_row + 1, insert_row - 1)
+        # nếu insert_row dính merge ở cột MSSV -> stop
+        if _cell_is_merged(insert_row, cols["mssv"]):
+            return False, f"❌ Dòng {insert_row} cột MSSV đang MERGE nên không thể thêm SV.", None
+
+        # =========================
+        # 4) copy style từ dòng trên
+        # =========================
+        template_row = insert_row - 1
+        if template_row < header_row + 1:
+            template_row = header_row + 1
 
         try:
             sheet.row_dimensions[insert_row].height = sheet.row_dimensions[template_row].height
@@ -664,36 +771,14 @@ def add_student_to_excel(class_name: str, student: dict):
         for c in range(1, sheet.max_column + 1):
             src = sheet.cell(row=template_row, column=c)
             dst = sheet.cell(row=insert_row, column=c)
-
-            # nếu dst là mergedcell thì skip (không copy vào được)
             if isinstance(dst, MergedCell) or isinstance(src, MergedCell):
                 continue
-
             _copy_cell_style(src, dst)
             dst.value = None
 
-        # ---------- 4) set values (SAFE) ----------
-        def _set(col_key, value):
-            if cols.get(col_key):
-                _safe_set(insert_row, cols[col_key], value)
-
-        # STT
-        if cols.get("stt"):
-            prev_cell = sheet.cell(row=template_row, column=cols["stt"])
-            prev_val = prev_cell.value
-            if isinstance(prev_val, (int, float)):
-                stt_val = int(prev_val) + 1
-            else:
-                # fallback count until total
-                stt_val = 1
-                end_r = total_row if total_row else (sheet.max_row + 1)
-                for rr in range(header_row + 1, end_r):
-                    mv = sheet.cell(row=rr, column=cols["mssv"]).value
-                    ms = str(mv).strip() if mv else ""
-                    if ms:
-                        stt_val += 1
-            _set("stt", stt_val)
-
+        # =========================
+        # 5) set values (KHÔNG ĐƯỢC LỆCH CỘT)
+        # =========================
         _set("mssv", target_mssv)
         _set("ho", student.get("Họ đệm", ""))
         _set("ten", student.get("Tên", ""))
@@ -707,12 +792,27 @@ def add_student_to_excel(class_name: str, student: dict):
 
         _set("lophoc", student.get("Lớp học", ""))
 
-        # renumber STT
-        _renumber_stt(sheet, header_row, cols)
+        # =========================
+        # 6) renumber STT (DỪNG BẰNG TOTAL)
+        # =========================
+        idx = 1
+        for r in range(header_row + 1, sheet.max_row + 1):
+            if _row_has_total(r):
+                break
+            mcell = sheet.cell(row=r, column=cols["mssv"])
+            if isinstance(mcell, MergedCell):
+                continue
+            mv = mcell.value
+            mssv = str(mv).strip() if mv else ""
+            if not mssv:
+                continue
+            sheet.cell(row=r, column=cols["stt"]).value = idx
+            idx += 1
 
-        # ---------- 5) update "Tổng cộng" (nếu có) ----------
+        # =========================
+        # 7) update tổng
+        # =========================
         try:
-            # tìm lại total_row (vì có thể bị shift)
             total_row2 = None
             for r in range(header_row + 1, sheet.max_row + 1):
                 if _row_has_total(r):
@@ -720,31 +820,30 @@ def add_student_to_excel(class_name: str, student: dict):
                     break
 
             if total_row2:
-                # đếm SV từ header tới trước total
                 count_sv = 0
                 for rr in range(header_row + 1, total_row2):
-                    mv = sheet.cell(row=rr, column=cols["mssv"]).value
+                    mcell = sheet.cell(row=rr, column=cols["mssv"])
+                    if isinstance(mcell, MergedCell):
+                        continue
+                    mv = mcell.value
                     ms = str(mv).strip() if mv else ""
                     if ms:
                         count_sv += 1
 
-                # tìm ô số (ưu tiên ô có number/formula trong dòng tổng)
-                placed = False
                 for cc in range(1, sheet.max_column + 1):
                     c = sheet.cell(row=total_row2, column=cc)
                     if isinstance(c, MergedCell):
                         continue
                     v = c.value
-                    if isinstance(v, (int, float)) or (isinstance(v, str) and v.strip().isdigit()) or (isinstance(v, str) and v.startswith("=")):
+                    if isinstance(v, (int, float)) or (isinstance(v, str) and v.strip().isdigit()) or (isinstance(v, str) and str(v).startswith("=")):
                         c.value = count_sv
-                        placed = True
                         break
-
-                # nếu không tìm được ô số thì bỏ qua (không crash)
         except:
             pass
 
-        # ---------- 6) save ----------
+        # =========================
+        # 8) save
+        # =========================
         saved_path, warn, is_copy = _safe_save_wb(wb, file_path, class_path, "DanhSachLop_UPDATED")
         if saved_path is None:
             return False, warn or "❌ Không thể lưu Excel.", None
@@ -753,43 +852,13 @@ def add_student_to_excel(class_name: str, student: dict):
             return True, f"✅ Đã thêm SV vào Excel (bản copy). {warn}", saved_path
 
         return True, "✅ Đã thêm SV vào Excel.", saved_path
-
     except Exception as e:
         return False, f"❌ Lỗi khi cập nhật Excel: {e}", None
-
-
-        # =========================
-        # 6) SAVE
-        # =========================
-        saved_path, warn, is_copy = _safe_save_wb(wb, file_path, class_path, "DanhSachLop_UPDATED")
-
-        # ✅ LOG ra terminal (để bắt bệnh)
-        try:
-            print("[ADD_SV] saved_path =", saved_path, "| warn =", warn, "| is_copy =", is_copy)
-        except:
-            pass
-
-        if saved_path is None:
-            return False, warn or "❌ Không thể lưu Excel.", None
-
-        if warn:
-            return True, f"✅ Đã thêm SV vào Excel (bản copy). {warn}", saved_path
-
-        return True, "✅ Đã thêm SV vào Excel.", saved_path
-
-    except Exception as e:
-        return False, f"❌ Lỗi khi cập nhật Excel: {e}", None
-
 def remove_student_from_excel(class_name: str, mssv: str):
-    """
-    Xóa sinh viên khỏi bảng Excel theo MSSV.
-    Return: (ok, msg, saved_path)
-    """
     class_path = os.path.join(ROOT_FOLDER, class_name)
     file_path = os.path.join(class_path, EXCEL_NAME)
     if not os.path.exists(file_path):
         return False, "⚠️ Lớp chưa có file Excel. Đã xóa SV khỏi app (roster.json), nhưng Excel chưa được cập nhật.", None
-
     try:
         wb = openpyxl.load_workbook(file_path)
         sheet = wb.active
@@ -809,52 +878,36 @@ def remove_student_from_excel(class_name: str, mssv: str):
             if ms.upper() == target:
                 row_to_del = r
                 break
-
         if row_to_del is None:
             return False, f"⚠️ Không tìm thấy MSSV {mssv} trong Excel.", None
-
         sheet.delete_rows(row_to_del, 1)
-
         # renumber STT cho đẹp
         _renumber_stt(sheet, header_row, cols)
-
         saved_path, warn, is_copy = _safe_save_wb(wb, file_path, class_path, "DanhSachLop_UPDATED")
         if saved_path is None:
             return False, warn or "❌ Không thể lưu Excel.", None
         if warn:
             return True, f"✅ Đã xóa SV trong Excel (bản copy). {warn}", saved_path
         return True, "✅ Đã xóa SV trong Excel.", saved_path
-
     except Exception as e:
         return False, f"❌ Lỗi khi xóa SV trong Excel: {e}", None
-
 def add_student_to_roster(class_name: str, student: dict):
-    """
-    Add student to roster.json (ưu tiên), không phụ thuộc excel.
-    Return: (ok, msg)
-    """
     df = load_roster(class_name, autosync_folders=False)
     mssv = str(student.get("MSSV", "")).strip()
     if not mssv:
         return False, "Vui lòng nhập MSSV."
-
     if df is None or df.empty:
         df = pd.DataFrame(columns=["MSSV", "Họ đệm", "Họ", "Tên", "Họ tên", "Giới tính", "Ngày sinh", "Lớp học"])
-
     exists = False
     try:
         exists = (df["MSSV"].astype(str).str.strip().str.upper() == mssv.upper()).any()
     except:
         exists = False
-
     if exists:
         return False, f"MSSV {mssv} đã tồn tại trong danh sách."
-
-    # normalize
     ho_dem = str(student.get("Họ đệm", "")).strip()
     ten = str(student.get("Tên", "")).strip()
     full_name = f"{ho_dem} {ten}".strip()
-
     row = {
         "MSSV": mssv,
         "Họ đệm": ho_dem,
@@ -865,19 +918,14 @@ def add_student_to_roster(class_name: str, student: dict):
         "Ngày sinh": _cell_to_text(student.get("Ngày sinh", "")),
         "Lớp học": str(student.get("Lớp học", "")).strip(),
     }
-
     df2 = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
     df2["MSSV"] = df2["MSSV"].astype(str).str.strip()
-
     save_roster_json(class_name, df2)
-
     # create folders now
     class_path, img_base, _ = ensure_class_paths(class_name)
     os.makedirs(os.path.join(img_base, mssv), exist_ok=True)
     os.makedirs(os.path.join(class_path, BAD_IMG_DIR, mssv), exist_ok=True)
-
     return True, f"✅ Đã thêm SV {mssv} vào roster (app)."
-
 def remove_student_from_roster(class_name: str, mssv: str):
     df = load_roster(class_name, autosync_folders=False)
     if df is None or df.empty:
@@ -1035,12 +1083,131 @@ def delete_student(class_name, mssv_to_delete: str, remove_folder: bool = False)
 # 8) TRAINING (ZIP / SINGLE) - GIỮ ẢNH LỖI
 # ==========================================================
 def _save_image_and_encode(img: Image.Image, save_path: str):
-    # Save
-    img.save(save_path)
-    # Encode
-    encs = face_recognition.face_encodings(face_recognition.load_image_file(save_path))
-    if encs:
-        return encs[0], None
+    # luôn lưu ảnh gốc
+    try:
+        img.save(save_path)
+    except:
+        pass
+
+    def _to_rgb(pil_img: Image.Image) -> Image.Image:
+        if pil_img.mode != "RGB":
+            pil_img = pil_img.convert("RGB")
+        return pil_img
+
+    def pick_biggest(locs):
+        return max(locs, key=lambda b: (b[2]-b[0]) * (b[1]-b[3]))
+
+    def try_encode(pil_img: Image.Image):
+        pil_img = _to_rgb(pil_img)
+        arr = np.asarray(pil_img, dtype=np.uint8)
+
+        # HOG: upsample mạnh hơn + jitter hơn chút
+        for up in (0, 1, 2, 3, 4, 5, 6):
+            locs = face_recognition.face_locations(
+                arr, number_of_times_to_upsample=up, model="hog"
+            )
+            if locs:
+                box = pick_biggest(locs)
+                encs = face_recognition.face_encodings(
+                    arr, known_face_locations=[box], num_jitters=3
+                )
+                if encs:
+                    return encs[0]
+
+        # thử CNN nếu chạy được (nếu môi trường không có sẽ tự bỏ qua)
+        try:
+            for up in (0, 1, 2, 3):
+                locs = face_recognition.face_locations(
+                    arr, number_of_times_to_upsample=up, model="cnn"
+                )
+                if locs:
+                    box = pick_biggest(locs)
+                    encs = face_recognition.face_encodings(
+                        arr, known_face_locations=[box], num_jitters=3
+                    )
+                    if encs:
+                        return encs[0]
+        except:
+            pass
+
+        return None
+
+    def center_crop(pil_img: Image.Image, scale=0.75):
+        w, h = pil_img.size
+        nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+        left = (w - nw) // 2
+        top = (h - nh) // 2
+        return pil_img.crop((left, top, left + nw, top + nh))
+
+    def upscale(pil_img: Image.Image, factor=1.8):
+        w, h = pil_img.size
+        nw, nh = int(w * factor), int(h * factor)
+        return pil_img.resize((nw, nh), Image.BICUBIC)
+
+    def enhance_variants(pil_img: Image.Image):
+        outs = []
+
+        base = _to_rgb(pil_img)
+        outs.append(base)
+
+        # autocontrast
+        try:
+            outs.append(ImageOps.autocontrast(base))
+        except:
+            pass
+
+        # brighten + contrast
+        try:
+            t = ImageEnhance.Brightness(base).enhance(1.35)
+            t = ImageEnhance.Contrast(t).enhance(1.35)
+            outs.append(t)
+        except:
+            pass
+
+        # sharpen nhẹ
+        try:
+            outs.append(base.filter(ImageFilter.SHARPEN))
+        except:
+            pass
+
+        # upscale + autocontrast + sharpen (combo cứu nhiều case)
+        try:
+            up = upscale(base, 1.8)
+            outs.append(up)
+            try:
+                outs.append(ImageOps.autocontrast(up))
+            except:
+                pass
+            try:
+                outs.append(up.filter(ImageFilter.SHARPEN))
+            except:
+                pass
+        except:
+            pass
+
+        return outs
+
+    # 1) thử trực tiếp + biến thể
+    for v in enhance_variants(img):
+        enc = try_encode(v)
+        if enc is not None:
+            try:
+                v.save(save_path)
+            except:
+                pass
+            return enc, None
+
+    # 2) crop giữa rồi thử lại + biến thể
+    cropped = center_crop(img, 0.75)
+    for v in enhance_variants(cropped):
+        enc = try_encode(v)
+        if enc is not None:
+            try:
+                v.save(save_path)
+            except:
+                pass
+            return enc, None
+
     return None, "NO_FACE"
 
 def train_single_student(class_name, mssv, uploaded_images):
